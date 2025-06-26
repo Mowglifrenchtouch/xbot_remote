@@ -3,8 +3,6 @@
 // Copyright (c) 2022 Clemens Elflein. All rights reserved.
 //
 #include <filesystem>
-#include <stdlib.h> 
-#include <algorithm>
 
 #include "ros/ros.h"
 #include <memory>
@@ -23,6 +21,7 @@
 
 typedef websocketpp::server<websocketpp::config::asio> server;
 typedef server::message_ptr message_ptr;
+double VxMax, VzMax;
 
 using json = nlohmann::json;
 
@@ -33,9 +32,12 @@ ros::Publisher cmd_vel_pub;
 
 // Create a server endpoint
 server echo_server;
-const double VxMax = 1.6;
-const double VzMax = 1.0;
 
+// dynamic param (mod by rosparam)
+double VxMax = 1.0;
+double VzMax = 3.2;
+double VxScale = 0.4;
+double VzScale = 3.2;
 // Define a callback to handle incoming messages
 void on_message(server* s, websocketpp::connection_hdl hdl, message_ptr msg) {
     try {
@@ -43,14 +45,14 @@ void on_message(server* s, websocketpp::connection_hdl hdl, message_ptr msg) {
 
         ROS_INFO_STREAM_THROTTLE(0.5, "vx:" << json["vx"] << " vr: " << json["vz"]);
         geometry_msgs::Twist t;
-
-        /*get percentage */
+        // get percentage //
         double vx = json["vx"].get<double>();
         double vz = json["vz"].get<double>();
 
+         // Normalisation
         t.linear.x = vx / VxMax;
         t.angular.z = vz / VzMax;
-
+        
         // square curve
         t.linear.x *= std::abs(t.linear.x);
         t.angular.z *= std::abs(t.angular.z);
@@ -59,16 +61,15 @@ void on_message(server* s, websocketpp::connection_hdl hdl, message_ptr msg) {
         t.linear.x = std::clamp(t.linear.x, -1.0, 1.0);
         t.angular.z = std::clamp(t.angular.z, -1.0, 1.0);
 
-        // scale to Vmax
-        t.linear.x *= 0.4;
-        t.angular.z *= 3.2;
+        // final scale //
+        t.linear.x = vx / VxMax;
+        t.angular.z = vz / VzMax;
 
         cmd_vel_pub.publish(t);
     } catch (std::exception &e) {
         ROS_ERROR_STREAM("Exception during remote decoding: " << e.what());
     }
 }
-
 
 void* server_thread(void* arg) {
     try {
@@ -101,7 +102,6 @@ void* server_thread(void* arg) {
         std::cout << "other exception" << std::endl;
         exit(1);
     }
-    return nullptr;
 }
 
 int main(int argc, char **argv) {
@@ -110,6 +110,11 @@ int main(int argc, char **argv) {
     n = new ros::NodeHandle();
     ros::NodeHandle paramNh("~");
 
+    // load config param
+    paramNh.param("VxMax", VxMax, 1.0);
+    paramNh.param("VzMax", VzMax, 3.2);
+    paramNh.param("VxScale", VxScale, 0.4);
+    paramNh.param("VzScale", VzScale, 3.2);
     cmd_vel_pub = n->advertise<geometry_msgs::Twist>("xbot_remote/cmd_vel", 1);
 
     pthread_t server_thread_handle;
