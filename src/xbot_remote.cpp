@@ -1,132 +1,118 @@
-//
-// Created by Clemens Elflein on 22.11.22.
-// Copyright (c) 2022 Clemens Elflein. All rights reserved.
-//
-#include <filesystem>
-
-#include "ros/ros.h"
-#include <memory>
-#include <boost/regex.hpp>
-#include "xbot_msgs/SensorInfo.h"
-#include "xbot_msgs/Map.h"
-#include "xbot_msgs/SensorDataString.h"
-#include "xbot_msgs/SensorDataDouble.h"
-#include "xbot_msgs/RobotState.h"
-#include <mqtt/async_client.h>
+#include <ros/ros.h>
+#include <geometry_msgs/Twist.h>
 #include <nlohmann/json.hpp>
-#include "geometry_msgs/Twist.h"
-#include "std_msgs/String.h"
-#include "websocketpp/server.hpp"
+#include <websocketpp/server.hpp>
 #include <websocketpp/config/asio_no_tls.hpp>
-
-typedef websocketpp::server<websocketpp::config::asio> server;
-typedef server::message_ptr message_ptr;
-double VxMax, VzMax;
+#include <thread>
+#include <memory>
+#include <mutex>
+#include <iostream>
 
 using json = nlohmann::json;
+using websocket_server = websocketpp::server<websocketpp::config::asio>;
+using connection_hdl = websocketpp::connection_hdl;
+using message_ptr = websocket_server::message_ptr;
 
-ros::NodeHandle *n;
+class XBotRemoteNode {
+public:
+    XBotRemoteNode()
+        : vx_max_(1.0), vz_max_(3.2), vx_scale_(0.4), vz_scale_(3.2), nh_("~") {
+        // Load parameters
+        nh_.param("VxMax", vx_max_, vx_max_);
+        nh_.param("VzMax", vz_max_, vz_max_);
+        nh_.param("VxScale", vx_scale_, vx_scale_);
+        nh_.param("VzScale", vz_scale_, vz_scale_);
 
-// Publisher for cmd_vel
-ros::Publisher cmd_vel_pub;
+        // Create ROS publisher
+        cmd_vel_pub_ = nh_.advertise<geometry_msgs::Twist>("xbot_remote/cmd_vel", 1);
 
-// Create a server endpoint
-server echo_server;
-
-// dynamic param (mod by rosparam)
-double VxMax = 1.0;
-double VzMax = 3.2;
-double VxScale = 0.4;
-double VzScale = 3.2;
-// Define a callback to handle incoming messages
-void on_message(server* s, websocketpp::connection_hdl hdl, message_ptr msg) {
-    try {
-        json json = json::from_bson(msg->get_payload());
-
-        ROS_INFO_STREAM_THROTTLE(0.5, "vx:" << json["vx"] << " vr: " << json["vz"]);
-        geometry_msgs::Twist t;
-        // get percentage //
-        double vx = json["vx"].get<double>();
-        double vz = json["vz"].get<double>();
-
-         // Normalisation
-        t.linear.x = vx / VxMax;
-        t.angular.z = vz / VzMax;
-        
-        // square curve
-        t.linear.x *= std::abs(t.linear.x);
-        t.angular.z *= std::abs(t.angular.z);
-
-        // clamp to [-1, 1]
-        t.linear.x = std::clamp(t.linear.x, -1.0, 1.0);
-        t.angular.z = std::clamp(t.angular.z, -1.0, 1.0);
-
-        // final scale //
-        t.linear.x = vx / VxMax;
-        t.angular.z = vz / VzMax;
-
-        cmd_vel_pub.publish(t);
-    } catch (std::exception &e) {
-        ROS_ERROR_STREAM("Exception during remote decoding: " << e.what());
+        // Set up WebSocket server
+        ws_server_.set_access_channels(websocketpp::log::alevel::none);
+        ws_server_.init_asio();
+        ws_server_.set_reuse_addr(true);
+        ws_server_.set_message_handler(
+            std::bind(&XBotRemoteNode::onMessage, this, std::placeholders::_1, std::placeholders::_2)
+        );
     }
-}
 
-void* server_thread(void* arg) {
-    try {
-        // Set logging settings
-        echo_server.set_access_channels(websocketpp::log::alevel::all);
-        echo_server.clear_access_channels(websocketpp::log::alevel::frame_payload);
+    void start() {
+        // Start server thread
+        ws_thread_ = std::thread([this]() {
+            try {
+                ws_server_.listen(9002);
+                ws_server_.start_accept();
+                while (ros::ok()) {
+                    ws_server_.run_one();
+                }
+            } catch (const std::exception& e) {
+                ROS_ERROR_STREAM("WebSocket error: " << e.what());
+            }
+        });
+    }
 
-        // Initialize Asio
-        echo_server.init_asio();
+    void spin() {
+        ros::spin();
+        shutdown();
+    }
 
-        // Register our message handler
-        echo_server.set_message_handler(bind(&on_message,&echo_server,::_1,::_2));
+    ~XBotRemoteNode() {
+        shutdown();
+    }
 
-        echo_server.set_reuse_addr(true);
-
-        // Listen on port 9002
-        echo_server.listen(9002);
-
-        // Start the server accept loop
-        echo_server.start_accept();
-
-        // Start the ASIO io_service run loop
-        while(ros::ok()) {
-            echo_server.run_one();
+private:
+    void shutdown() {
+        if (ws_server_.is_listening()) {
+            ROS_INFO("Stopping WebSocket server...");
+            ws_server_.stop_listening();
         }
-    } catch (websocketpp::exception const & e) {
-        std::cout << e.what() << std::endl;
-        exit(1);
-    } catch (...) {
-        std::cout << "other exception" << std::endl;
-        exit(1);
+        if (ws_thread_.joinable()) {
+            ws_thread_.join();
+            ROS_INFO("WebSocket thread shut down.");
+        }
     }
-}
 
-int main(int argc, char **argv) {
+    void onMessage(connection_hdl hdl, message_ptr msg) {
+        try {
+            auto payload = json::from_bson(msg->get_payload());
+            double vx = payload["vx"].get<double>();
+            double vz = payload["vz"].get<double>();
+
+            ROS_INFO_STREAM_THROTTLE(0.5, "vx: " << vx << " vz: " << vz);
+
+            geometry_msgs::Twist twist;
+
+            // Normalize and shape curve
+            twist.linear.x = clampAndShape(vx / vx_max_);
+            twist.angular.z = clampAndShape(vz / vz_max_);
+
+            cmd_vel_pub_.publish(twist);
+        } catch (const std::exception& e) {
+            ROS_ERROR_STREAM("JSON decode error: " << e.what());
+        }
+    }
+
+    static double clampAndShape(double value) {
+        value *= std::abs(value); // Square response
+        return std::max(-1.0, std::min(1.0, value)); // Clamp [-1, 1]
+    }
+
+    // ROS
+    ros::NodeHandle nh_;
+    ros::Publisher cmd_vel_pub_;
+
+    // Parameters
+    double vx_max_, vz_max_;
+    double vx_scale_, vz_scale_;
+
+    // WebSocket server
+    websocket_server ws_server_;
+    std::thread ws_thread_;
+};
+
+int main(int argc, char** argv) {
     ros::init(argc, argv, "xbot_remote");
-
-    n = new ros::NodeHandle();
-    ros::NodeHandle paramNh("~");
-
-    // load config param
-    paramNh.param("VxMax", VxMax, 1.0);
-    paramNh.param("VzMax", VzMax, 3.2);
-    paramNh.param("VxScale", VxScale, 0.4);
-    paramNh.param("VzScale", VzScale, 3.2);
-    cmd_vel_pub = n->advertise<geometry_msgs::Twist>("xbot_remote/cmd_vel", 1);
-
-    pthread_t server_thread_handle;
-    pthread_create(&server_thread_handle, nullptr, &server_thread, nullptr);
-
-    ros::spin();
-    ROS_INFO_STREAM("Stopping websocket server");
-    echo_server.stop();
-
-    ROS_INFO_STREAM("Waiting for server thread to shutdown");
-    pthread_join(server_thread_handle, nullptr);
-    ROS_INFO_STREAM("Server shut down");
-
+    XBotRemoteNode node;
+    node.start();
+    node.spin();
     return 0;
 }
